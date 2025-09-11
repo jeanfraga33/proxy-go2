@@ -1,122 +1,355 @@
 package main
 
 import (
-	"crypto/tls"
+	"bufio"
+	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
 	"fmt"
 	"io"
 	"log"
+	"math/big"
 	"net"
+	"net/http"
 	"os"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
+
+	"github.com/gorilla/websocket"
 )
 
-func handleConnection(conn net.Conn, tlsConfig *tls.Config) {
-	buffer := make([]byte, 1024)
-	n, err := conn.Read(buffer)
-	if err != nil {
-		log.Printf("Erro ao ler dados iniciais: %v", err)
-		conn.Close()
-		return
+var (
+	upgrader = websocket.Upgrader{
+		CheckOrigin: func(r *http.Request) bool { return true }, // Allow all origins for simplicity
 	}
 
-	data := buffer[:n]
-
-	if isTLS(data) {
-		tlsConn := tls.Server(conn, tlsConfig)
-		err := tlsConn.Handshake()
-		if err != nil {
-			log.Printf("Handshake TLS falhou: %v", err)
-			conn.Close()
-			return
-		}
-		log.Println("🔒 Conexão TLS detectada")
-		handleProtocol(tlsConn, data)
-	} else {
-		log.Println("🔓 Conexão sem TLS detectada")
-		handleProtocol(conn, data)
-	}
-}
-
-func handleProtocol(conn net.Conn, data []byte) {
-	switch {
-	case isWebSocket(data):
-		log.Println("🌐 Conexão WebSocket detectada")
-		conn.Write([]byte("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"))
-	case isSOCKS5(data):
-		log.Println("🧦 Conexão SOCKS5 detectada")
-		handleSOCKS5(conn, data)
-	case isHTTP101(data) || isHTTP200(data):
-		log.Println("📄 Conexão HTTP detectada")
-		conn.Write([]byte("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nProxyEuro ativo\n"))
-	default:
-		log.Println("❌ Protocolo desconhecido")
-		conn.Close()
-	}
-}
-
-func handleSOCKS5(conn net.Conn, data []byte) {
-	conn.Write([]byte{0x05, 0x00})
-	buffer := make([]byte, 1024)
-	n, err := conn.Read(buffer)
-	if err != nil {
-		log.Printf("Erro SOCKS5: %v", err)
-		conn.Close()
-		return
-	}
-	conn.Write([]byte{0x05, 0x01, 0x00, 0x01, 127, 0, 0, 1, 0x1F, 0x90})
-}
-
-func isTLS(data []byte) bool {
-	return len(data) > 0 && data[0] == 0x16
-}
-
-func isHTTP101(data []byte) bool {
-	return strings.HasPrefix(string(data), "HTTP/1.1 101")
-}
-
-func isHTTP200(data []byte) bool {
-	return strings.HasPrefix(string(data), "HTTP/1.1 200")
-}
-
-func isWebSocket(data []byte) bool {
-	return strings.HasPrefix(string(data), "GET / HTTP/1.1")
-}
-
-func isSOCKS5(data []byte) bool {
-	return len(data) > 0 && data[0] == 0x05
-}
+	servers = make(map[int]*http.Server)
+	mu      sync.Mutex
+)
 
 func main() {
-	if len(os.Args) != 2 {
-		fmt.Println("Uso: ./proxy_worker <porta>")
-		os.Exit(1)
-	}
+	menu()
+}
 
-	porta := os.Args[1]
-	certDir := "/etc/proxyeuro/" + porta
-	certFile := certDir + "/cert.pem"
-	keyFile := certDir + "/key.pem"
-
-	tlsCert, err := tls.LoadX509KeyPair(certFile, keyFile)
-	if err != nil {
-		log.Fatalf("Erro carregando certificado TLS: %v", err)
-	}
-
-	tlsConfig := &tls.Config{Certificates: []tls.Certificate{tlsCert}}
-
-	listener, err := net.Listen("tcp", ":"+porta)
-	if err != nil {
-		log.Fatalf("Erro ao escutar na porta %s: %v", porta, err)
-	}
-
-	log.Printf("🚀 Proxy escutando na porta %s...", porta)
+func menu() {
+	scanner := bufio.NewScanner(os.Stdin)
 	for {
-		conn, err := listener.Accept()
-		if err != nil {
-			log.Printf("Erro ao aceitar conexão: %v", err)
-			continue
+		fmt.Println("\n=== Proxy Menu ===")
+		fmt.Println("1. Open port")
+		fmt.Println("2. Close port")
+		fmt.Println("3. List open ports")
+		fmt.Println("4. Exit")
+		fmt.Print("Choose an option: ")
+		if !scanner.Scan() {
+			break
 		}
-		go handleConnection(conn, tlsConfig)
+		input := strings.TrimSpace(scanner.Text())
+		switch input {
+		case "1":
+			openPort(scanner)
+		case "2":
+			closePort(scanner)
+		case "3":
+			listPorts()
+		case "4":
+			closeAllPorts()
+			os.Exit(0)
+		default:
+			fmt.Println("Invalid option")
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		log.Fatal("Scanner error:", err)
+	}
+}
+
+func generateSelfSignedCert(keyFile, certFile string) error {
+	// Remove existing files if they exist
+	if err := os.Remove(keyFile); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("error removing key file: %v", err)
+	}
+	if err := os.Remove(certFile); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("error removing cert file: %v", err)
+	}
+
+	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		return fmt.Errorf("error generating private key: %v", err)
+	}
+
+	notBefore := time.Now()
+	notAfter := notBefore.Add(365 * 24 * time.Hour)
+
+	serialNumberLimit := new(big.Int).Lsh(big.NewInt(1), 128)
+	serialNumber, err := rand.Int(rand.Reader, serialNumberLimit)
+	if err != nil {
+		return fmt.Errorf("error generating serial number: %v", err)
+	}
+
+	template := x509.Certificate{
+		SerialNumber: serialNumber,
+		Subject: pkix.Name{
+			Organization: []string{"Proxy Server"},
+			CommonName:   "localhost",
+		},
+		NotBefore:             notBefore,
+		NotAfter:              notAfter,
+		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+	}
+
+	template.IPAddresses = []net.IP{net.IPv4(127, 0, 0, 1), net.ParseIP("::1")}
+	template.DNSNames = []string{"localhost"}
+
+	derBytes, err := x509.CreateCertificate(rand.Reader, &template, &template, &privateKey.PublicKey, privateKey)
+	if err != nil {
+		return fmt.Errorf("error creating certificate: %v", err)
+	}
+
+	// Encode private key
+	keyOut, err := os.Create(keyFile)
+	if err != nil {
+		return fmt.Errorf("error creating key file: %v", err)
+	}
+	defer keyOut.Close()
+	pem.Encode(keyOut, &pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(privateKey)})
+
+	// Encode certificate
+	certOut, err := os.Create(certFile)
+	if err != nil {
+		return fmt.Errorf("error creating cert file: %v", err)
+	}
+	defer certOut.Close()
+	pem.Encode(certOut, &pem.Block{Type: "CERTIFICATE", Bytes: derBytes})
+
+	return nil
+}
+
+func openPort(scanner *bufio.Scanner) {
+	fmt.Print("Enter port to listen on: ")
+	if !scanner.Scan() {
+		return
+	}
+	portStr := strings.TrimSpace(scanner.Text())
+	port, err := strconv.Atoi(portStr)
+	if err != nil || port < 1 || port > 65535 {
+		fmt.Println("Invalid port")
+		return
+	}
+
+	mu.Lock()
+	if _, exists := servers[port]; exists {
+		mu.Unlock()
+		fmt.Println("Port already open")
+		return
+	}
+	mu.Unlock()
+
+	certFile := "cert.pem"
+	keyFile := "key.pem"
+
+	if err := generateSelfSignedCert(keyFile, certFile); err != nil {
+		fmt.Printf("Error generating self-signed certificate: %v\n", err)
+		return
+	}
+	fmt.Println("Self-signed certificate generated successfully.")
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", handleProxyRequest)
+
+	server := &http.Server{
+		Addr:      ":" + portStr,
+		Handler:   mux,
+		TLSConfig: &tls.Config{}, // Basic TLS config; customize as needed (e.g., MinVersion: tls.VersionTLS12)
+	}
+
+	mu.Lock()
+	servers[port] = server
+	mu.Unlock()
+
+	go func() {
+		if err := server.ListenAndServeTLS(certFile, keyFile); err != nil && err != http.ErrServerClosed {
+			log.Printf("Secure server on port %d error: %v", port, err)
+		}
+	}()
+
+	fmt.Printf("Secure port %d opened (HTTPS/WSS support) and listening in background\n", port)
+}
+
+func closePort(scanner *bufio.Scanner) {
+	fmt.Print("Enter port to close: ")
+	if !scanner.Scan() {
+		return
+	}
+	portStr := strings.TrimSpace(scanner.Text())
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		fmt.Println("Invalid port")
+		return
+	}
+
+	mu.Lock()
+	server, exists := servers[port]
+	mu.Unlock()
+
+	if !exists {
+		fmt.Println("Port not open")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := server.Shutdown(ctx); err != nil {
+		log.Printf("Error shutting down server on port %d: %v", port, err)
+	}
+	mu.Lock()
+	delete(servers, port)
+	mu.Unlock()
+	fmt.Printf("Port %d closed\n", port)
+}
+
+func listPorts() {
+	mu.Lock()
+	defer mu.Unlock()
+	if len(servers) == 0 {
+		fmt.Println("No ports open")
+		return
+	}
+	fmt.Println("Open ports:")
+	for port := range servers {
+		fmt.Printf("- %d (Secure: HTTPS/WSS)\n", port)
+	}
+}
+
+func closeAllPorts() {
+	mu.Lock()
+	defer mu.Unlock()
+	for port, server := range servers {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if err := server.Shutdown(ctx); err != nil {
+			log.Printf("Error closing port %d: %v", port, err)
+		}
+		delete(servers, port)
+	}
+}
+
+func handleProxyRequest(w http.ResponseWriter, r *http.Request) {
+	// Accept all types of requests: Handle WS, CONNECT (SOCKS-like), and fallback for others
+	if r.Method == "CONNECT" {
+		// Handle SOCKS-like tunneling via HTTP CONNECT over HTTPS
+		fmt.Fprint(w, "HTTP/1.1 200 Connection established\r\n\r\n")
+
+		hijacker, ok := w.(http.Hijacker)
+		if !ok {
+			http.Error(w, "Hijacking not supported", http.StatusInternalServerError)
+			return
+		}
+
+		clientConn, _, err := hijacker.Hijack()
+		if err != nil {
+			log.Printf("Hijack error: %v", err)
+			return
+		}
+		defer clientConn.Close()
+
+		// Forward to OpenSSH (localhost:22) for authentication
+		sshConn, err := net.Dial("tcp", "127.0.0.1:22")
+		if err != nil {
+			log.Printf("Failed to connect to SSH: %v", err)
+			return
+		}
+		defer sshConn.Close()
+
+		// Bidirectional pipe - connection stays open until client disconnects
+		go io.Copy(clientConn, sshConn)
+		io.Copy(sshConn, clientConn) // Blocks until closed
+		return
+	}
+
+	// Handle WebSocket upgrade (now WSS since server is TLS)
+	if websocket.IsWebSocketUpgrade(r) && strings.ToLower(r.Header.Get("Upgrade")) == "websocket" {
+		wsConn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			log.Printf("WebSocket upgrade error: %v", err)
+			return
+		}
+		defer wsConn.Close()
+
+		// Forward to OpenSSH (localhost:22) for authentication
+		sshConn, err := net.Dial("tcp", "127.0.0.1:22")
+		if err != nil {
+			log.Printf("Failed to connect to SSH: %v", err)
+			return
+		}
+		defer sshConn.Close()
+
+		// Bidirectional forwarding: WS binary messages <-> raw TCP bytes
+		go forwardTCPToWS(wsConn, sshConn)
+		forwardWSToTCP(wsConn, sshConn)
+		return
+	}
+
+	// Fallback for all other requests (including no specific request or unknown types): Respond 200 and forward to SSH
+	w.Header().Set("Content-Type", "text/plain")
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprint(w, "HTTP/1.1 200 OK\r\n\r\nProxy forwarding...")
+
+	hijacker, ok := w.(http.Hijacker)
+	if !ok {
+		http.Error(w, "Hijacking not supported", http.StatusInternalServerError)
+		return
+	}
+
+	clientConn, _, err := hijacker.Hijack()
+	if err != nil {
+		log.Printf("Hijack error: %v", err)
+		return
+	}
+	defer clientConn.Close()
+
+	// Forward to OpenSSH (localhost:22) for authentication
+	sshConn, err := net.Dial("tcp", "127.0.0.1:22")
+	if err != nil {
+		log.Printf("Failed to connect to SSH: %v", err)
+		return
+	}
+	defer sshConn.Close()
+
+	// Bidirectional pipe - connection stays open until client disconnects
+	go io.Copy(clientConn, sshConn)
+	io.Copy(sshConn, clientConn) // Blocks until closed
+}
+
+func forwardWSToTCP(wsConn *websocket.Conn, tcpConn net.Conn) {
+	defer tcpConn.Close()
+	for {
+		_, msg, err := wsConn.ReadMessage()
+		if err != nil {
+			break
+		}
+		_, err = tcpConn.Write(msg)
+		if err != nil {
+			break
+		}
+	}
+}
+
+func forwardTCPToWS(wsConn *websocket.Conn, tcpConn net.Conn) {
+	defer tcpConn.Close()
+	buf := make([]byte, 1024)
+	for {
+		n, err := tcpConn.Read(buf)
+		if err != nil || n == 0 {
+			break
+		}
+		if err := wsConn.WriteMessage(websocket.BinaryMessage, buf[:n]); err != nil {
+			break
+		}
 	}
 }
