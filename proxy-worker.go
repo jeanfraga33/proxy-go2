@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/gorilla/websocket"
 )
@@ -136,27 +137,52 @@ func openPort(scanner *bufio.Scanner) {
 func handleConnection(conn net.Conn, port int) {
 	defer conn.Close()
 
-	// Sniff first 8 bytes to detect protocol
-	buf := make([]byte, 8)
+	// Sniff first 16 bytes to detect protocol
+	buf := make([]byte, 16)
 	n, err := conn.Read(buf)
 	if err != nil {
 		log.Printf("Failed to read initial bytes: %v", err)
 		return
 	}
 
+	// Read up to 32 bytes total for logging if UNKNOWN
+	logBuf := buf[:n]
+	if n < 16 {
+		extraBuf := make([]byte, 16-n)
+		extraN, _ := conn.Read(extraBuf)
+		logBuf = append(buf[:n], extraBuf[:extraN]...)
+	}
+
 	protocol := detectProtocol(buf[:n])
-	log.Printf("Detected protocol: %s from %s, first bytes: %s", protocol, conn.RemoteAddr(), hex.EncodeToString(buf[:n]))
+	log.Printf("Detected protocol: %s from %s, first bytes: %s, decoded: %q",
+		protocol, conn.RemoteAddr(), hex.EncodeToString(logBuf), printableString(logBuf))
 
 	switch protocol {
 	case "SOCKS5":
 		handleSOCKS5(conn, buf[:n])
 	case "HTTP":
 		handleHTTP(conn, port, false)
-	case "TLS", "UNKNOWN": // Treat UNKNOWN as TLS/WSS
+	case "TLS":
 		handleTLS(conn, port)
+	case "UNKNOWN":
+		// Treat UNKNOWN as HTTP (likely malformed HTTP from HTTP Injector)
+		handleHTTP(conn, port, false)
 	default:
 		log.Printf("Unsupported protocol")
 	}
+}
+
+// printableString converts bytes to a string, replacing non-printable characters with '.'
+func printableString(b []byte) string {
+	runes := make([]rune, len(b))
+	for i, c := range b {
+		if unicode.IsPrint(rune(c)) {
+			runes[i] = rune(c)
+		} else {
+			runes[i] = '.'
+		}
+	}
+	return string(runes)
 }
 
 func detectProtocol(buf []byte) string {
@@ -166,11 +192,18 @@ func detectProtocol(buf []byte) string {
 	if len(buf) >= 3 && buf[0] == 0x16 && buf[1] == 0x03 { // TLS ClientHello
 		return "TLS"
 	}
-	// Check for HTTP methods (GET, POST, CONNECT, etc.)
+	// Check for HTTP methods, ignoring leading non-printable characters
 	httpMethods := []string{"GET ", "POST ", "PUT ", "HEAD ", "CONNECT ", "OPTIONS ", "DELETE ", "TRACE ", "PATCH "}
-	for _, method := range httpMethods {
-		if strings.HasPrefix(string(buf), method) {
-			return "HTTP"
+	data := string(buf)
+	for i := 0; i < len(data); i++ {
+		// Skip non-printable characters (e.g., 0x0a)
+		if i > 0 && !unicode.IsPrint(rune(data[i])) {
+			continue
+		}
+		for _, method := range httpMethods {
+			if strings.HasPrefix(data[i:], method) {
+				return "HTTP"
+			}
 		}
 	}
 	return "UNKNOWN"
