@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
@@ -166,7 +167,7 @@ func openPort(scanner *bufio.Scanner) {
 	server := &http.Server{
 		Addr:      ":" + portStr,
 		Handler:   mux,
-		TLSConfig: &tls.Config{}, // Basic TLS config; customize as needed (e.g., MinVersion: tls.VersionTLS12)
+		TLSConfig: &tls.Config{MinVersion: tls.VersionTLS12}, // Ensure secure TLS version
 	}
 
 	mu.Lock()
@@ -272,7 +273,7 @@ func handleProxyRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Handle WebSocket upgrade (now WSS since server is TLS)
+	// Handle WebSocket upgrade (WSS since server is TLS)
 	if websocket.IsWebSocketUpgrade(r) && strings.ToLower(r.Header.Get("Upgrade")) == "websocket" {
 		wsConn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
@@ -295,7 +296,7 @@ func handleProxyRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Fallback for all other requests (including no specific request or unknown types): Respond 200 and forward to SSH
+	// Fallback for all other requests (including no specific request or unknown types)
 	w.Header().Set("Content-Type", "text/plain")
 	w.WriteHeader(http.StatusOK)
 	fmt.Fprint(w, "HTTP/1.1 200 OK\r\n\r\nProxy forwarding...")
