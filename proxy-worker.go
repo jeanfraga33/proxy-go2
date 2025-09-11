@@ -149,7 +149,7 @@ func handleConnection(conn net.Conn, port int) {
 
 	switch protocol {
 	case "SOCKS5":
-		handleSOCKS5(conn)
+		handleSOCKS5(conn, buf[:n])
 	case "HTTP":
 		handleHTTP(conn, port, false)
 	case "TLS":
@@ -176,15 +176,9 @@ func detectProtocol(buf []byte) string {
 	return "UNKNOWN"
 }
 
-func handleSOCKS5(conn net.Conn) {
-	// Basic SOCKS5 handler: Auth (no auth), then connect to SSH
-	buf := make([]byte, 256)
-	n, err := conn.Read(buf)
-	if err != nil {
-		log.Printf("SOCKS5 read error: %v", err)
-		return
-	}
-	if buf[0] != 0x05 {
+func handleSOCKS5(conn net.Conn, initialBuf []byte) {
+	// Process initial buffer (SOCKS5 version and auth methods)
+	if initialBuf[0] != 0x05 {
 		conn.Write([]byte{0x05, 0x01, 0x00})
 		return
 	}
@@ -192,15 +186,16 @@ func handleSOCKS5(conn net.Conn) {
 	conn.Write([]byte{0x05, 0x00})
 
 	// Read connect request
-	n, err = conn.Read(buf)
-	if err != nil || buf[0] != 0x05 || buf[1] != 0x01 {
+	buf := make([]byte, 256)
+	n, err := conn.Read(buf)
+	if err != nil || n < 10 || buf[0] != 0x05 || buf[1] != 0x01 {
 		log.Printf("Invalid SOCKS5 connect request: %v", err)
 		return
 	}
 	// Parse addr (simple: assume IPv4)
 	ip := net.IP(buf[4:8])
 	port := (uint16(buf[8]) << 8) | uint16(buf[9])
-	target := fmt.Sprintf("%s:%d", ip, port)
+	log.Printf("SOCKS5 connect request to %s:%d", ip, port)
 
 	sshConn, err := net.Dial("tcp", "127.0.0.1:22")
 	if err != nil {
@@ -401,9 +396,9 @@ func closePort(scanner *bufio.Scanner) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	ln.Close()
+	if err := ln.Close(); err != nil {
+		log.Printf("Error closing port %d: %v", port, err)
+	}
 
 	mu.Lock()
 	delete(listeners, port)
@@ -428,9 +423,9 @@ func closeAllPorts() {
 	mu.Lock()
 	defer mu.Unlock()
 	for port, ln := range listeners {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		ln.Close()
+		if err := ln.Close(); err != nil {
+			log.Printf("Error closing port %d: %v", port, err)
+		}
 		delete(listeners, port)
 	}
 }
