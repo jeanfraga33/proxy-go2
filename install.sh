@@ -35,17 +35,28 @@ install_proxy() {
     TEMP_DIR="/tmp/proxy-go2"
     rm -rf "$TEMP_DIR"
     echo "Clonando repositório..."
-    git clone https://github.com/jeanfraga33/proxy-go2.git "$TEMP_DIR"
+    if ! git clone https://github.com/jeanfraga33/proxy-go2.git "$TEMP_DIR"; then
+        echo "Erro ao clonar repositório."
+        exit 1
+    fi
     cd "$TEMP_DIR" || exit 1
 
     # Instala dependências Go
     echo "Instalando dependências Go..."
     go mod init proxy-go2 || true
-    go get github.com/gorilla/websocket
+    if ! go get github.com/gorilla/websocket; then
+        echo "Erro ao instalar dependências Go."
+        exit 1
+    fi
 
     # Compila o binário
     echo "Compilando proxy..."
-    go build -o proxyfull proxy-worker.go
+    if ! go build -o proxyfull proxy-worker.go; then
+        echo "Erro ao compilar proxy. Verifique o código em proxy-worker.go."
+        cd /
+        rm -rf "$TEMP_DIR"
+        exit 1
+    fi
 
     # Instala no sistema
     sudo mv proxyfull /usr/local/bin/
