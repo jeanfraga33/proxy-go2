@@ -205,7 +205,7 @@ func closePort(scanner *bufio.Scanner) {
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
+	defer cancel() // Ensure cancel is called to release resources
 	if err := server.Shutdown(ctx); err != nil {
 		log.Printf("Error shutting down server on port %d: %v", port, err)
 	}
@@ -233,6 +233,7 @@ func closeAllPorts() {
 	defer mu.Unlock()
 	for port, server := range servers {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel() // Ensure cancel is called to release resources
 		if err := server.Shutdown(ctx); err != nil {
 			log.Printf("Error closing port %d: %v", port, err)
 		}
