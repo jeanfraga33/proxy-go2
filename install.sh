@@ -110,7 +110,7 @@ uninstall_proxy() {
 
 # Menu interativo
 while true; do
-    echo -e "\n=== Instalador do Proxyfull ==="
+    echo -e "\n=== Instalador do Proxyfull 1.2==="
     echo "1. Instalar/Atualizar Proxyfull"
     echo "2. Desinstalar Proxyfull"
     echo "3. Sair"
