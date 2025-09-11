@@ -41,7 +41,7 @@ func menu() {
 	scanner := bufio.NewScanner(os.Stdin)
 	for {
 		fmt.Println("\n=== Proxy Menu ===")
-		fmt.Println("1. Open port")
+		fmt.Println("1. Open port (HTTP and HTTPS/WSS)")
 		fmt.Println("2. Close port")
 		fmt.Println("3. List open ports")
 		fmt.Println("4. Exit")
@@ -152,9 +152,9 @@ func openPort(scanner *bufio.Scanner) {
 	}
 	mu.Unlock()
 
+	// Generate certificates for HTTPS/WSS
 	certFile := "cert.pem"
 	keyFile := "key.pem"
-
 	if err := generateSelfSignedCert(keyFile, certFile); err != nil {
 		fmt.Printf("Error generating self-signed certificate: %v\n", err)
 		return
@@ -164,23 +164,38 @@ func openPort(scanner *bufio.Scanner) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", handleProxyRequest)
 
-	server := &http.Server{
+	// HTTPS/WSS server
+	serverTLS := &http.Server{
 		Addr:      ":" + portStr,
 		Handler:   mux,
-		TLSConfig: &tls.Config{MinVersion: tls.VersionTLS12}, // Ensure secure TLS version
+		TLSConfig: &tls.Config{MinVersion: tls.VersionTLS12},
+	}
+
+	// HTTP server (non-TLS)
+	serverHTTP := &http.Server{
+		Addr:    ":" + portStr,
+		Handler: mux,
 	}
 
 	mu.Lock()
-	servers[port] = server
+	servers[port] = serverTLS // Store TLS server for management
 	mu.Unlock()
 
+	// Start HTTP server in background
 	go func() {
-		if err := server.ListenAndServeTLS(certFile, keyFile); err != nil && err != http.ErrServerClosed {
-			log.Printf("Secure server on port %d error: %v", port, err)
+		if err := serverHTTP.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Printf("HTTP server on port %d error: %v", port, err)
 		}
 	}()
 
-	fmt.Printf("Secure port %d opened (HTTPS/WSS support) and listening in background\n", port)
+	// Start HTTPS/WSS server in background
+	go func() {
+		if err := serverTLS.ListenAndServeTLS(certFile, keyFile); err != nil && err != http.ErrServerClosed {
+			log.Printf("HTTPS/WSS server on port %d error: %v", port, err)
+		}
+	}()
+
+	fmt.Printf("Port %d opened (HTTP and HTTPS/WSS support) and listening in background\n", port)
 }
 
 func closePort(scanner *bufio.Scanner) {
@@ -205,7 +220,7 @@ func closePort(scanner *bufio.Scanner) {
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel() // Ensure cancel is called to release resources
+	defer cancel()
 	if err := server.Shutdown(ctx); err != nil {
 		log.Printf("Error shutting down server on port %d: %v", port, err)
 	}
@@ -224,7 +239,7 @@ func listPorts() {
 	}
 	fmt.Println("Open ports:")
 	for port := range servers {
-		fmt.Printf("- %d (Secure: HTTPS/WSS)\n", port)
+		fmt.Printf("- %d (HTTP and HTTPS/WSS)\n", port)
 	}
 }
 
@@ -233,7 +248,7 @@ func closeAllPorts() {
 	defer mu.Unlock()
 	for port, server := range servers {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel() // Ensure cancel is called to release resources
+		defer cancel()
 		if err := server.Shutdown(ctx); err != nil {
 			log.Printf("Error closing port %d: %v", port, err)
 		}
@@ -242,13 +257,15 @@ func closeAllPorts() {
 }
 
 func handleProxyRequest(w http.ResponseWriter, r *http.Request) {
-	// Accept all types of requests: Handle WS, CONNECT (SOCKS-like), and fallback for others
+	log.Printf("Received request: Method=%s, URL=%s, Headers=%v, RemoteAddr=%s", r.Method, r.URL, r.Header, r.RemoteAddr)
+
 	if r.Method == "CONNECT" {
-		// Handle SOCKS-like tunneling via HTTP CONNECT over HTTPS
+		// Handle SOCKS-like tunneling via HTTP CONNECT
 		fmt.Fprint(w, "HTTP/1.1 200 Connection established\r\n\r\n")
 
 		hijacker, ok := w.(http.Hijacker)
 		if !ok {
+			log.Println("Hijacking not supported")
 			http.Error(w, "Hijacking not supported", http.StatusInternalServerError)
 			return
 		}
@@ -270,11 +287,11 @@ func handleProxyRequest(w http.ResponseWriter, r *http.Request) {
 
 		// Bidirectional pipe - connection stays open until client disconnects
 		go io.Copy(clientConn, sshConn)
-		io.Copy(sshConn, clientConn) // Blocks until closed
+		io.Copy(sshConn, clientConn)
 		return
 	}
 
-	// Handle WebSocket upgrade (WSS since server is TLS)
+	// Handle WebSocket upgrade (WS or WSS)
 	if websocket.IsWebSocketUpgrade(r) && strings.ToLower(r.Header.Get("Upgrade")) == "websocket" {
 		wsConn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
@@ -297,13 +314,14 @@ func handleProxyRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Fallback for all other requests (including no specific request or unknown types)
+	// Fallback for all other requests
 	w.Header().Set("Content-Type", "text/plain")
 	w.WriteHeader(http.StatusOK)
 	fmt.Fprint(w, "HTTP/1.1 200 OK\r\n\r\nProxy forwarding...")
 
 	hijacker, ok := w.(http.Hijacker)
 	if !ok {
+		log.Println("Hijacking not supported")
 		http.Error(w, "Hijacking not supported", http.StatusInternalServerError)
 		return
 	}
@@ -325,7 +343,7 @@ func handleProxyRequest(w http.ResponseWriter, r *http.Request) {
 
 	// Bidirectional pipe - connection stays open until client disconnects
 	go io.Copy(clientConn, sshConn)
-	io.Copy(sshConn, clientConn) // Blocks until closed
+	io.Copy(sshConn, clientConn)
 }
 
 func forwardWSToTCP(wsConn *websocket.Conn, tcpConn net.Conn) {
