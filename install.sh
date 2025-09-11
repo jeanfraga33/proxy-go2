@@ -6,6 +6,24 @@ if ! grep -Eq "ID=(ubuntu|debian)" /etc/os-release; then
     exit 1
 fi
 
+# Diretório de instalação dos certificados
+CERT_DIR="/usr/local/share/proxyfull"
+CERT_FILE="$CERT_DIR/cert.pem"
+KEY_FILE="$CERT_DIR/key.pem"
+
+# Função para gerar certificados autoassinados
+generate_certificates() {
+    echo "Gerando certificados autoassinados..."
+    mkdir -p "$CERT_DIR"
+    openssl req -x509 -newkey rsa:2048 -keyout "$KEY_FILE" -out "$CERT_FILE" -days 365 -nodes -subj "/C=US/ST=State/L=City/O=Proxy Server/CN=localhost"
+    if [ $? -eq 0 ]; then
+        echo "Certificados gerados em $CERT_DIR"
+    else
+        echo "Erro ao gerar certificados."
+        exit 1
+    fi
+}
+
 # Função para instalar dependências
 install_dependencies() {
     echo "Verificando dependências..."
@@ -18,6 +36,10 @@ install_dependencies() {
         echo "Instalando Git..."
         sudo apt install -y git
     fi
+    if ! command -v openssl &> /dev/null; then
+        echo "Instalando OpenSSL..."
+        sudo apt install -y openssl
+    fi
     echo "Dependências verificadas/instaladas."
 }
 
@@ -27,9 +49,12 @@ install_proxy() {
     if command -v proxyfull &> /dev/null; then
         echo "Proxyfull já instalado. Desinstalando versão anterior para atualizar."
         sudo rm -f /usr/local/bin/proxyfull
-        rm -f cert.pem key.pem
+        sudo rm -rf "$CERT_DIR"
         echo "Versão anterior e certificados removidos."
     fi
+
+    # Gera certificados
+    generate_certificates
 
     # Baixa o repositório temporariamente
     TEMP_DIR="/tmp/proxy-go2"
@@ -61,6 +86,7 @@ install_proxy() {
     # Instala no sistema
     sudo mv proxyfull /usr/local/bin/
     echo "Proxy instalado com sucesso em /usr/local/bin/proxyfull."
+    echo "Certificados em $CERT_DIR"
     echo "Execute 'proxyfull' para iniciar."
 
     # Limpa o diretório temporário
@@ -77,14 +103,14 @@ uninstall_proxy() {
     else
         echo "Proxyfull não está instalado."
     fi
-    # Remove certificados, se existirem
-    rm -f cert.pem key.pem
-    echo "Certificados (cert.pem, key.pem) removidos, se existiam."
+    # Remove certificados e diretório
+    sudo rm -rf "$CERT_DIR"
+    echo "Certificados e diretório removidos, se existiam."
 }
 
 # Menu interativo
 while true; do
-    echo -e "\n=== Instalador do Proxyfull 1.1 ==="
+    echo -e "\n=== Instalador do Proxyfull ==="
     echo "1. Instalar/Atualizar Proxyfull"
     echo "2. Desinstalar Proxyfull"
     echo "3. Sair"
