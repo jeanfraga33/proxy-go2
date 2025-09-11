@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"crypto/tls"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"log"
@@ -135,26 +136,26 @@ func openPort(scanner *bufio.Scanner) {
 func handleConnection(conn net.Conn, port int) {
 	defer conn.Close()
 
-	// Sniff first 4 bytes to detect protocol
-	buf := make([]byte, 4)
+	// Sniff first 8 bytes to detect protocol
+	buf := make([]byte, 8)
 	n, err := conn.Read(buf)
-	if err != nil || n < 2 {
+	if err != nil {
 		log.Printf("Failed to read initial bytes: %v", err)
 		return
 	}
 
 	protocol := detectProtocol(buf[:n])
-	log.Printf("Detected protocol: %s from %s", protocol, conn.RemoteAddr())
+	log.Printf("Detected protocol: %s from %s, first bytes: %s", protocol, conn.RemoteAddr(), hex.EncodeToString(buf[:n]))
 
 	switch protocol {
 	case "SOCKS5":
 		handleSOCKS5(conn, buf[:n])
 	case "HTTP":
 		handleHTTP(conn, port, false)
-	case "TLS":
+	case "TLS", "UNKNOWN": // Treat UNKNOWN as TLS/WSS
 		handleTLS(conn, port)
 	default:
-		log.Printf("Unknown protocol")
+		log.Printf("Unsupported protocol")
 	}
 }
 
@@ -188,7 +189,7 @@ func handleSOCKS5(conn net.Conn, initialBuf []byte) {
 	buf := make([]byte, 256)
 	n, err := conn.Read(buf)
 	if err != nil || n < 10 || buf[0] != 0x05 || buf[1] != 0x01 {
-		log.Printf("Invalid SOCKS5 connect request: %v", err)
+		log.Printf("Invalid SOCKS5 connect request: %v, bytes read: %d", err, n)
 		return
 	}
 	// Parse addr (simple: assume IPv4)
@@ -350,7 +351,7 @@ func handleTLS(conn net.Conn, port int) {
 		log.Printf("Failed to load certs: %v", err)
 		return
 	}
-	tlsConfig := &tls.Config{Certificates: []tls.Certificate{cert}}
+	tlsConfig := &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}
 	tlsConn := tls.Server(conn, tlsConfig)
 	if err := tlsConn.Handshake(); err != nil {
 		log.Printf("TLS handshake error: %v", err)
